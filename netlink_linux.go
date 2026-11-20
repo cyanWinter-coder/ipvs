@@ -162,12 +162,24 @@ func (i *Handle) doCmdwithResponse(s *Service, d *Destination, cmd ipvsCmd) ([][
 		req.AddData(attr)
 	}
 
-	res, err := execute(i.sock, req)
+	res, err := i.doExecute(req)
 	if err != nil {
 		return [][]byte{}, err
 	}
 
 	return res, nil
+}
+
+// doExecute sends req on the handle's netlink socket and returns the raw
+// response payloads. It serializes access to the socket so that concurrent
+// queries on the same handle do not interleave their request/reply cycles.
+func (i *Handle) doExecute(req *nl.NetlinkRequest) ([][]byte, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.executeFn != nil {
+		return i.executeFn(req)
+	}
+	return execute(i.sock, req)
 }
 
 func (i *Handle) doCmd(s *Service, d *Destination, cmd ipvsCmd) error {
@@ -234,6 +246,7 @@ func newGenlRequest(familyID int, cmd uint8) *nl.NetlinkRequest {
 	return req
 }
 
+// execute sends req over s and collects the response payloads of the dump.
 func execute(s *nl.NetlinkSocket, req *nl.NetlinkRequest) ([][]byte, error) {
 	if err := s.Send(req); err != nil {
 		return nil, err
@@ -292,103 +305,193 @@ func parseIP(ip []byte, family uint16) (net.IP, error) {
 	switch family {
 	case syscall.AF_INET:
 		if len(ip) < net.IPv4len {
-			return nil, fmt.Errorf("invalid IPv4 address: %d bytes", len(ip))
+			return nil, fmt.Errorf("%w: invalid IPv4 address: %d bytes", ErrTruncatedRecord, len(ip))
 		}
 		return ip[:net.IPv4len], nil
 	case syscall.AF_INET6:
 		if len(ip) < net.IPv6len {
-			return nil, fmt.Errorf("invalid IPv6 address: %d bytes", len(ip))
+			return nil, fmt.Errorf("%w: invalid IPv6 address: %d bytes", ErrTruncatedRecord, len(ip))
 		}
 		return ip[:net.IPv6len], nil
 	default:
-		return nil, fmt.Errorf("unsupported address family: %d", family)
+		return nil, fmt.Errorf("%w: unsupported address family: %d", ErrUnknownAddressFamily, family)
 	}
+}
+
+// attrUint16, attrUint32, and attrUint64 decode fixed-width attribute values,
+// rejecting attributes that are too short instead of letting the binary
+// package panic or silently read adjacent memory. Values carrying
+// NLA_F_NET_BYTEORDER are decoded as big-endian, as the kernel writes them
+// with nla_put_net*.
+func attrOrder(attr syscall.NetlinkRouteAttr) binary.ByteOrder {
+	if attr.Attr.Type&unix.NLA_F_NET_BYTEORDER != 0 {
+		return binary.BigEndian
+	}
+	return native
+}
+
+func attrUint16(attr syscall.NetlinkRouteAttr) (uint16, error) {
+	if len(attr.Value) < 2 {
+		return 0, fmt.Errorf("%w: attribute type %d has %d bytes, need 2",
+			ErrTruncatedRecord, attrType(attr.Attr.Type), len(attr.Value))
+	}
+	return attrOrder(attr).Uint16(attr.Value), nil
+}
+
+func attrUint32(attr syscall.NetlinkRouteAttr) (uint32, error) {
+	if len(attr.Value) < 4 {
+		return 0, fmt.Errorf("%w: attribute type %d has %d bytes, need 4",
+			ErrTruncatedRecord, attrType(attr.Attr.Type), len(attr.Value))
+	}
+	return attrOrder(attr).Uint32(attr.Value), nil
+}
+
+func attrUint64(attr syscall.NetlinkRouteAttr) (uint64, error) {
+	if len(attr.Value) < 8 {
+		return 0, fmt.Errorf("%w: attribute type %d has %d bytes, need 8",
+			ErrTruncatedRecord, attrType(attr.Attr.Type), len(attr.Value))
+	}
+	return attrOrder(attr).Uint64(attr.Value), nil
+}
+
+// attrPort decodes a port, which the kernel always transmits with
+// nla_put_be16 - in network byte order, but without NLA_F_NET_BYTEORDER.
+func attrPort(attr syscall.NetlinkRouteAttr) (uint16, error) {
+	if len(attr.Value) < 2 {
+		return 0, fmt.Errorf("%w: attribute type %d has %d bytes, need 2",
+			ErrTruncatedRecord, attrType(attr.Attr.Type), len(attr.Value))
+	}
+	return binary.BigEndian.Uint16(attr.Value), nil
+}
+
+// attrString decodes a zero-terminated string attribute. Unlike
+// nl.BytesToString it does not panic when the terminator is missing.
+func attrString(attr syscall.NetlinkRouteAttr) string {
+	if i := bytes.IndexByte(attr.Value, 0); i >= 0 {
+		return string(attr.Value[:i])
+	}
+	return string(attr.Value)
 }
 
 // parseStats
 func assembleStats(msg []byte) (SvcStats, error) {
 	var s SvcStats
 
-	attrs, err := nl.ParseRouteAttr(msg)
+	attrs, err := parseRouteAttrs(msg)
 	if err != nil {
 		return s, err
 	}
 
 	for _, attr := range attrs {
-		switch ipvsStats(attr.Attr.Type) {
+		var err error
+		switch ipvsStats(attrType(attr.Attr.Type)) {
 		case ipvsStatsUnspec:
 			// unspecified
 		case ipvsStatsConns:
-			s.Connections = native.Uint32(attr.Value)
+			s.Connections, err = attrUint32(attr)
 		case ipvsStatsPktsIn:
-			s.PacketsIn = native.Uint32(attr.Value)
+			s.PacketsIn, err = attrUint32(attr)
 		case ipvsStatsPktsOut:
-			s.PacketsOut = native.Uint32(attr.Value)
+			s.PacketsOut, err = attrUint32(attr)
 		case ipvsStatsBytesIn:
-			s.BytesIn = native.Uint64(attr.Value)
+			s.BytesIn, err = attrUint64(attr)
 		case ipvsStatsBytesOut:
-			s.BytesOut = native.Uint64(attr.Value)
+			s.BytesOut, err = attrUint64(attr)
 		case ipvsStatsCPS:
-			s.CPS = native.Uint32(attr.Value)
+			s.CPS, err = attrUint32(attr)
 		case ipvsStatsPPSIn:
-			s.PPSIn = native.Uint32(attr.Value)
+			s.PPSIn, err = attrUint32(attr)
 		case ipvsStatsPPSOut:
-			s.PPSOut = native.Uint32(attr.Value)
+			s.PPSOut, err = attrUint32(attr)
 		case ipvsStatsBPSIn:
-			s.BPSIn = native.Uint32(attr.Value)
+			s.BPSIn, err = attrUint32(attr)
 		case ipvsStatsBPSOut:
-			s.BPSOut = native.Uint32(attr.Value)
+			s.BPSOut, err = attrUint32(attr)
+		}
+		if err != nil {
+			return SvcStats{}, err
 		}
 	}
 	return s, nil
 }
 
-// assembleService assembles a services back from a hain of netlink attributes
+// assembleService assembles a service back from a chain of netlink attributes.
+// Records missing an address family, or missing the address of an
+// address-based (non-firewall-mark) service, are rejected instead of being
+// returned as partly zero-valued services.
 func assembleService(attrs []syscall.NetlinkRouteAttr) (*Service, error) {
 	var s Service
 	var addressBytes []byte
+	var (
+		haveFamily  bool
+		haveAddress bool
+		haveFWMark  bool
+	)
 
 	for _, attr := range attrs {
-		switch ipvsSvcAttr(attr.Attr.Type) {
+		var err error
+		switch ipvsSvcAttr(attrType(attr.Attr.Type)) {
 		case ipvsSvcAttrUnspec:
 			// unspecified
 		case ipvsSvcAttrAddressFamily:
-			s.AddressFamily = native.Uint16(attr.Value)
+			s.AddressFamily, err = attrUint16(attr)
+			haveFamily = true
 		case ipvsSvcAttrProtocol:
-			s.Protocol = native.Uint16(attr.Value)
+			s.Protocol, err = attrUint16(attr)
 		case ipvsSvcAttrAddress:
 			addressBytes = attr.Value
+			haveAddress = true
 		case ipvsSvcAttrPort:
-			s.Port = binary.BigEndian.Uint16(attr.Value)
+			s.Port, err = attrPort(attr)
 		case ipvsSvcAttrFWMark:
-			s.FWMark = native.Uint32(attr.Value)
+			s.FWMark, err = attrUint32(attr)
+			haveFWMark = true
 		case ipvsSvcAttrSchedName:
-			s.SchedName = nl.BytesToString(attr.Value)
+			s.SchedName = attrString(attr)
 		case ipvsSvcAttrFlags:
-			s.Flags = native.Uint32(attr.Value)
+			s.Flags, err = attrUint32(attr)
 		case ipvsSvcAttrTimeout:
-			s.Timeout = native.Uint32(attr.Value)
+			s.Timeout, err = attrUint32(attr)
 		case ipvsSvcAttrNetmask:
-			s.Netmask = native.Uint32(attr.Value)
+			s.Netmask, err = attrUint32(attr)
 		case ipvsSvcAttrPEName:
-			s.PEName = nl.BytesToString(attr.Value)
+			s.PEName = attrString(attr)
 		case ipvsSvcAttrStats:
-			stats, err := assembleStats(attr.Value)
-			if err != nil {
-				return nil, err
+			var stats SvcStats
+			stats, err = assembleStats(attr.Value)
+			if err == nil {
+				s.Stats = stats
 			}
-			s.Stats = stats
 		}
-	}
-
-	// parse Address after parse AddressFamily incase of parseIP error
-	if addressBytes != nil {
-		ip, err := parseIP(addressBytes, s.AddressFamily)
 		if err != nil {
 			return nil, err
 		}
-		s.Address = ip
 	}
+
+	if !haveFamily {
+		return nil, fmt.Errorf("%w: service record has no address family attribute", ErrMissingAttribute)
+	}
+	switch s.AddressFamily {
+	case syscall.AF_INET, syscall.AF_INET6:
+		// supported; address parsing below validates the length.
+	default:
+		return nil, fmt.Errorf("%w: service record has unsupported address family %d",
+			ErrUnknownAddressFamily, s.AddressFamily)
+	}
+
+	// Address-based services carry an address; firewall-mark services do not.
+	if !haveAddress {
+		if !haveFWMark {
+			return nil, fmt.Errorf("%w: service record has neither address nor firewall mark", ErrMissingAttribute)
+		}
+		return &s, nil
+	}
+
+	ip, err := parseIP(addressBytes, s.AddressFamily)
+	if err != nil {
+		return nil, err
+	}
+	s.Address = ip
 
 	return &s, nil
 }
@@ -399,20 +502,29 @@ func (i *Handle) parseService(msg []byte) (*Service, error) {
 
 	// Remove General header for this message and parse the NetLink message
 	if len(msg) < genlMsgHdrLen {
-		return nil, errors.New("invalid generic netlink response: message too short")
+		return nil, fmt.Errorf("%w: invalid generic netlink response: message too short", ErrTruncatedRecord)
 	}
-	NetLinkAttrs, err := nl.ParseRouteAttr(msg[genlMsgHdrLen:])
+	msgAttrs, err := parseRouteAttrs(msg[genlMsgHdrLen:])
 	if err != nil {
 		return nil, err
 	}
-	if len(NetLinkAttrs) == 0 {
-		return nil, errors.New("error no valid netlink message found while parsing service record")
+	if len(msgAttrs) == 0 {
+		return nil, fmt.Errorf("%w: no service attribute in netlink response", ErrMissingAttribute)
+	}
+
+	// The service is nested in an IPVS_CMD_ATTR_SERVICE attribute.
+	cmdAttr := msgAttrs[0]
+	if attrType(cmdAttr.Attr.Type) != uint16(ipvsCmdAttrService) {
+		return nil, fmt.Errorf("%w: expected service attribute, got attribute type %d", ErrMalformedRecord, attrType(cmdAttr.Attr.Type))
 	}
 
 	// Now Parse and get IPVS related attributes messages packed in this message.
-	ipvsAttrs, err := nl.ParseRouteAttr(NetLinkAttrs[0].Value)
+	ipvsAttrs, err := parseRouteAttrs(cmdAttr.Value)
 	if err != nil {
 		return nil, err
+	}
+	if len(ipvsAttrs) == 0 {
+		return nil, fmt.Errorf("%w: no valid netlink message found while parsing service record", ErrMissingAttribute)
 	}
 
 	// Assemble all the IPVS related attribute messages and create a service record
@@ -424,23 +536,136 @@ func (i *Handle) parseService(msg []byte) (*Service, error) {
 	return s, nil
 }
 
-// doGetServicesCmd a wrapper which could be used commonly for both GetServices() and GetService(*Service)
-func (i *Handle) doGetServicesCmd(svc *Service) ([]*Service, error) {
-	var res []*Service
+// parseRouteAttrs parses a sequence of netlink attributes. Unlike
+// nl.ParseRouteAttr it rejects trailing bytes that cannot form a complete
+// attribute, and reports attributes whose payload is cut short with
+// ErrTruncatedRecord, so that a cut-off response is never silently accepted as
+// a valid record. Zero padding at the end of the buffer is allowed, as the
+// kernel may not pad the final attribute's payload to a 4-byte boundary.
+func parseRouteAttrs(b []byte) ([]syscall.NetlinkRouteAttr, error) {
+	var attrs []syscall.NetlinkRouteAttr
 
+	for len(b) > 0 {
+		if len(b) < unix.SizeofRtAttr {
+			if isZeros(b) {
+				// Trailing alignment padding, not an attribute.
+				break
+			}
+			return nil, fmt.Errorf("%w: %d trailing bytes cannot form a netlink attribute", ErrTruncatedRecord, len(b))
+		}
+		attrLen := int(native.Uint16(b[:2]))
+		if attrLen < unix.SizeofRtAttr {
+			return nil, fmt.Errorf("%w: netlink attribute length %d is smaller than its header", ErrMalformedRecord, attrLen)
+		}
+		if attrLen > len(b) {
+			return nil, fmt.Errorf("%w: netlink attribute claims %d bytes, %d available", ErrTruncatedRecord, attrLen, len(b))
+		}
+
+		// attrLen was read from a uint16, so it always fits back into one.
+		attrs = append(attrs, syscall.NetlinkRouteAttr{
+			Attr:  syscall.RtAttr{Len: uint16(attrLen), Type: native.Uint16(b[2:4])}, //nolint:gosec // attrLen is a decoded uint16
+			Value: b[unix.SizeofRtAttr:attrLen],
+		})
+
+		aligned := rtaAlignOf(attrLen)
+		if aligned > len(b) {
+			if !isZeros(b[attrLen:]) {
+				return nil, fmt.Errorf("%w: netlink attribute claims %d aligned bytes, %d available", ErrTruncatedRecord, aligned, len(b))
+			}
+			break
+		}
+		b = b[aligned:]
+	}
+
+	return attrs, nil
+}
+
+func rtaAlignOf(attrLen int) int {
+	return (attrLen + unix.SizeofRtAttr - 1) &^ (unix.SizeofRtAttr - 1)
+}
+
+// attrType strips the netlink attribute flags from a type, leaving the
+// attribute identifier. The flags are not part of the attribute's identity:
+// the kernel marks nested attributes (NLA_F_NESTED) and network-byte-order
+// values (NLA_F_NET_BYTEORDER), so the raw type must be masked before it is
+// compared against the IPVS attribute constants. The byte-order flag still
+// affects how a value is decoded; see attrOrder.
+func attrType(t uint16) uint16 {
+	return t &^ uint16(unix.NLA_F_NESTED|unix.NLA_F_NET_BYTEORDER)
+}
+
+// doGetServicesCmd a wrapper which could be used commonly for both GetServices() and GetService(*Service).
+//
+// GetServices has always failed without returning any records when a record
+// cannot be decoded, so the decoded prefix is discarded here.
+func (i *Handle) doGetServicesCmd(svc *Service) ([]*Service, error) {
 	msgs, err := i.doCmdwithResponse(svc, nil, ipvsCmdGetService)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, msg := range msgs {
-		srv, err := i.parseService(msg)
-		if err != nil {
-			return nil, err
-		}
-		res = append(res, srv)
+	res, err := decodeRecordsStrict(msgs, "service", i.parseService)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// doGetServicesPartialCmd decodes all service records in a dump response,
+// keeping valid records and reporting invalid ones individually.
+func (i *Handle) doGetServicesPartialCmd(svc *Service) ([]*Service, error) {
+	msgs, err := i.doCmdwithResponse(svc, nil, ipvsCmdGetService)
+	if err != nil {
+		return nil, err
 	}
 
+	return decodeRecordsPartial(msgs, "service", i.parseService)
+}
+
+// decodeRecordsStrict decodes records in a dump response and stops at the
+// first record that cannot be decoded. The records decoded before the failure
+// are returned together with an error identifying the failing record.
+//
+// Callers decide whether to expose that prefix: GetServices discards it (as it
+// always has), while GetDestinations has historically returned it alongside
+// the error.
+func decodeRecordsStrict[T any](msgs [][]byte, resource string, parse func([]byte) (*T, error)) ([]*T, error) {
+	res := make([]*T, 0, len(msgs))
+	for index, msg := range msgs {
+		record, err := parse(msg)
+		if err != nil {
+			return res, fmt.Errorf("parse %s record %d: %w", resource, index, err)
+		}
+		res = append(res, record)
+	}
+	return res, nil
+}
+
+// decodeRecordsPartial decodes every record in a dump response in order. Valid
+// records are returned in netlink response order; invalid records are skipped
+// and reported together as a *PartialResultError. Indexes refer to positions
+// in the full response, so a skipped record does not shift the indexes of the
+// records that follow it.
+func decodeRecordsPartial[T any](msgs [][]byte, resource string, parse func([]byte) (*T, error)) ([]*T, error) {
+	res := make([]*T, 0, len(msgs))
+	var recordErrs []*RecordError
+
+	for index, msg := range msgs {
+		record, err := parse(msg)
+		if err != nil {
+			recordErrs = append(recordErrs, &RecordError{Index: index, Err: err})
+			continue
+		}
+		res = append(res, record)
+	}
+
+	if len(recordErrs) > 0 {
+		return res, &PartialResultError{
+			Resource: resource,
+			Total:    len(msgs),
+			Records:  recordErrs,
+		}
+	}
 	return res, nil
 }
 
@@ -448,48 +673,69 @@ func (i *Handle) doGetServicesCmd(svc *Service) ([]*Service, error) {
 func (i *Handle) doCmdWithoutAttr(cmd ipvsCmd) ([][]byte, error) {
 	req := newIPVSRequest(cmd)
 	req.Seq = atomic.AddUint32(&i.seq, 1)
-	return execute(i.sock, req)
+	return i.doExecute(req)
 }
 
+// assembleDestination assembles a destination back from a chain of netlink
+// attributes. Records without an address are rejected instead of being
+// returned as partly zero-valued destinations.
 func assembleDestination(attrs []syscall.NetlinkRouteAttr) (*Destination, error) {
 	var d Destination
 	var addressBytes []byte
+	var haveAddress bool
 
 	for _, attr := range attrs {
-		switch ipvsDestAttr(attr.Attr.Type) {
+		var err error
+		switch ipvsDestAttr(attrType(attr.Attr.Type)) {
 		case ipvsDestAttrUnspec:
 			// unspecified
 		case ipvsDestAttrAddressFamily:
-			d.AddressFamily = native.Uint16(attr.Value)
+			d.AddressFamily, err = attrUint16(attr)
 		case ipvsDestAttrAddress:
 			addressBytes = attr.Value
+			haveAddress = true
 		case ipvsDestAttrPort:
-			d.Port = binary.BigEndian.Uint16(attr.Value)
+			d.Port, err = attrPort(attr)
 		case ipvsDestAttrForwardingMethod:
-			d.ConnectionFlags = native.Uint32(attr.Value)
+			d.ConnectionFlags, err = attrUint32(attr)
 		case ipvsDestAttrWeight:
-			d.Weight = int(native.Uint32(attr.Value))
+			var weight uint32
+			weight, err = attrUint32(attr)
+			d.Weight = int(weight)
 		case ipvsDestAttrUpperThreshold:
-			d.UpperThreshold = native.Uint32(attr.Value)
+			d.UpperThreshold, err = attrUint32(attr)
 		case ipvsDestAttrLowerThreshold:
-			d.LowerThreshold = native.Uint32(attr.Value)
+			d.LowerThreshold, err = attrUint32(attr)
 		case ipvsDestAttrActiveConnections:
-			d.ActiveConnections = int(native.Uint32(attr.Value))
+			var active uint32
+			active, err = attrUint32(attr)
+			d.ActiveConnections = int(active)
 		case ipvsDestAttrInactiveConnections:
-			d.InactiveConnections = int(native.Uint32(attr.Value))
+			var inactive uint32
+			inactive, err = attrUint32(attr)
+			d.InactiveConnections = int(inactive)
 		case ipvsDestAttrPersistentConnections:
-			d.PersistentConnections = int(native.Uint32(attr.Value))
+			var persistent uint32
+			persistent, err = attrUint32(attr)
+			d.PersistentConnections = int(persistent)
 		case ipvsDestAttrStats:
-			stats, err := assembleStats(attr.Value)
-			if err != nil {
-				return nil, err
+			var stats SvcStats
+			stats, err = assembleStats(attr.Value)
+			if err == nil {
+				d.Stats = DstStats(stats)
 			}
-			d.Stats = DstStats(stats)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	// in older kernels (< 3.18), the destination address family attribute doesn't exist so we must
-	// assume it based on the destination address provided.
+	if !haveAddress {
+		return nil, fmt.Errorf("%w: destination record has no address attribute", ErrMissingAttribute)
+	}
+
+	// In older kernels (< 3.18), the destination address family attribute
+	// doesn't exist, so it must be inferred from the address data.
 	if d.AddressFamily == 0 {
 		// we can't check the address family using net stdlib because netlink returns
 		// IPv4 addresses as the first 4 bytes in a []byte of length 16 where as
@@ -501,14 +747,11 @@ func assembleDestination(attrs []syscall.NetlinkRouteAttr) (*Destination, error)
 		d.AddressFamily = addressFamily
 	}
 
-	// parse Address after parse AddressFamily incase of parseIP error
-	if addressBytes != nil {
-		ip, err := parseIP(addressBytes, d.AddressFamily)
-		if err != nil {
-			return nil, err
-		}
-		d.Address = ip
+	ip, err := parseIP(addressBytes, d.AddressFamily)
+	if err != nil {
+		return nil, err
 	}
+	d.Address = ip
 
 	return &d, nil
 }
@@ -526,7 +769,14 @@ func getIPFamily(address []byte) (uint16, error) {
 		return syscall.AF_INET, nil
 	}
 
+	// An address shorter than the IPv4 header cannot carry a family.
+	if len(address) < net.IPv4len {
+		return 0, fmt.Errorf("%w: address data too short: %d bytes", ErrTruncatedRecord, len(address))
+	}
+
 	if isZeros(address) {
+		// Keep the historical error value: getIPFamily has long reported
+		// this exact error for an address without a usable family.
 		return 0, errors.New("could not parse IP family from address data")
 	}
 
@@ -553,18 +803,24 @@ func (i *Handle) parseDestination(msg []byte) (*Destination, error) {
 
 	// Remove General header for this message
 	if len(msg) < genlMsgHdrLen {
-		return nil, errors.New("invalid generic netlink response: message too short")
+		return nil, fmt.Errorf("%w: invalid generic netlink response: message too short", ErrTruncatedRecord)
 	}
-	NetLinkAttrs, err := nl.ParseRouteAttr(msg[genlMsgHdrLen:])
+	msgAttrs, err := parseRouteAttrs(msg[genlMsgHdrLen:])
 	if err != nil {
 		return nil, err
 	}
-	if len(NetLinkAttrs) == 0 {
-		return nil, errors.New("error no valid netlink message found while parsing destination record")
+	if len(msgAttrs) == 0 {
+		return nil, fmt.Errorf("%w: no destination attribute in netlink response", ErrMissingAttribute)
+	}
+
+	// The destination is nested in an IPVS_CMD_ATTR_DEST attribute.
+	cmdAttr := msgAttrs[0]
+	if attrType(cmdAttr.Attr.Type) != uint16(ipvsCmdAttrDest) {
+		return nil, fmt.Errorf("%w: expected destination attribute, got attribute type %d", ErrMalformedRecord, attrType(cmdAttr.Attr.Type))
 	}
 
 	// Now Parse and get IPVS related attributes messages packed in this message.
-	ipvsAttrs, err := nl.ParseRouteAttr(NetLinkAttrs[0].Value)
+	ipvsAttrs, err := parseRouteAttrs(cmdAttr.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -580,21 +836,23 @@ func (i *Handle) parseDestination(msg []byte) (*Destination, error) {
 
 // doGetDestinationsCmd a wrapper function to be used by GetDestinations and GetDestination(d) apis
 func (i *Handle) doGetDestinationsCmd(s *Service, d *Destination) ([]*Destination, error) {
-	var res []*Destination
-
 	msgs, err := i.doCmdwithResponse(s, d, ipvsCmdGetDest)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, msg := range msgs {
-		dest, err := i.parseDestination(msg)
-		if err != nil {
-			return res, err
-		}
-		res = append(res, dest)
+	return decodeRecordsStrict(msgs, "destination", i.parseDestination)
+}
+
+// doGetDestinationsPartialCmd decodes all destination records in a dump
+// response, keeping valid records and reporting invalid ones individually.
+func (i *Handle) doGetDestinationsPartialCmd(s *Service, d *Destination) ([]*Destination, error) {
+	msgs, err := i.doCmdwithResponse(s, d, ipvsCmdGetDest)
+	if err != nil {
+		return nil, err
 	}
-	return res, nil
+
+	return decodeRecordsPartial(msgs, "destination", i.parseDestination)
 }
 
 // parseConfig given a ipvs netlink response this function will respond with a valid config entry, an error otherwise
@@ -603,25 +861,33 @@ func (i *Handle) parseConfig(msg []byte) (*Config, error) {
 
 	// Remove General header for this message
 	if len(msg) < genlMsgHdrLen {
-		return nil, errors.New("invalid generic netlink response: message too short")
+		return nil, fmt.Errorf("%w: invalid generic netlink response: message too short", ErrTruncatedRecord)
 	}
-	attrs, err := nl.ParseRouteAttr(msg[genlMsgHdrLen:])
+	attrs, err := parseRouteAttrs(msg[genlMsgHdrLen:])
 	if err != nil {
 		return nil, err
 	}
 
 	for _, attr := range attrs {
-		switch ipvsCmdAttr(attr.Attr.Type) {
+		var value uint32
+		var err error
+		switch ipvsCmdAttr(attrType(attr.Attr.Type)) {
 		case ipvsCmdAttrUnspec:
 			// unspecified
 		case ipvsCmdAttrTimeoutTCP:
-			c.TimeoutTCP = time.Duration(native.Uint32(attr.Value)) * time.Second
+			value, err = attrUint32(attr)
+			c.TimeoutTCP = time.Duration(value) * time.Second
 		case ipvsCmdAttrTimeoutTCPFin:
-			c.TimeoutTCPFin = time.Duration(native.Uint32(attr.Value)) * time.Second
+			value, err = attrUint32(attr)
+			c.TimeoutTCPFin = time.Duration(value) * time.Second
 		case ipvsCmdAttrTimeoutUDP:
-			c.TimeoutUDP = time.Duration(native.Uint32(attr.Value)) * time.Second
+			value, err = attrUint32(attr)
+			c.TimeoutUDP = time.Duration(value) * time.Second
 		case ipvsCmdAttrService, ipvsCmdAttrDest, ipvsCmdAttrDaemon:
 			// not implemented
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -633,6 +899,9 @@ func (i *Handle) doGetConfigCmd() (*Config, error) {
 	msg, err := i.doCmdWithoutAttr(ipvsCmdGetConfig)
 	if err != nil {
 		return nil, err
+	}
+	if len(msg) == 0 {
+		return nil, fmt.Errorf("%w: empty configuration response", ErrTruncatedRecord)
 	}
 
 	res, err := i.parseConfig(msg[0])
@@ -651,7 +920,7 @@ func (i *Handle) doSetConfigCmd(c *Config) error {
 	req.AddData(nl.NewRtAttr(int(ipvsCmdAttrTimeoutTCPFin), nl.Uint32Attr(uint32(c.TimeoutTCPFin.Seconds()))))
 	req.AddData(nl.NewRtAttr(int(ipvsCmdAttrTimeoutUDP), nl.Uint32Attr(uint32(c.TimeoutUDP.Seconds()))))
 
-	_, err := execute(i.sock, req)
+	_, err := i.doExecute(req)
 
 	return err
 }
